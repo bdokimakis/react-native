@@ -550,10 +550,15 @@ public class ReactEditText extends AppCompatEditText
     if (reactTextUpdate.getText().length() == 0) {
       setText(null);
     } else {
+      String updatedText = reactTextUpdate.getText().toString();
+      int selectionStart = getSelectionStart();
+      int selectionEnd = getSelectionEnd();
+
       // When we update text, we trigger onChangeText code that will
       // try to update state if the wrapper is available. Temporarily disable
       // to prevent an infinite loop.
-      getText().replace(0, length(), spannableStringBuilder);
+      setText(updatedText);
+      setSelection(selectionStart, selectionEnd);
     }
     mDisableTextDiffing = false;
 
