@@ -18,6 +18,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.text.Editable;
 import android.text.InputType;
+import android.text.Selection;
 import android.text.Spannable;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
@@ -551,8 +552,8 @@ public class ReactEditText extends AppCompatEditText
       setText(null);
     } else {
       String updatedText = reactTextUpdate.getText().toString();
-      int selectionStart = getSelectionStart();
-      int selectionEnd = getSelectionEnd();
+      int selectionStart = reactTextUpdate.getText().length();
+      int selectionEnd = reactTextUpdate.getText().length();
 
       // When we update text, we trigger onChangeText code that will
       // try to update state if the wrapper is available. Temporarily disable
