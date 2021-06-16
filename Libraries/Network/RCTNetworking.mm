@@ -17,6 +17,7 @@
 #import <React/RCTUtils.h>
 
 #import <React/RCTHTTPRequestHandler.h>
+#import <React/RCTFileRequestHandler.h>
 
 #import "RCTNetworkPlugins.h"
 
@@ -148,7 +149,7 @@ static NSString *RCTGenerateFormBoundary()
   NSMutableDictionary<NSNumber *, RCTNetworkTask *> *_tasksByRequestID;
   std::mutex _handlersLock;
   NSArray<id<RCTURLRequestHandler>> *_handlers;
-  NSArray<id<RCTURLRequestHandler>> * (^_handlersProvider)(void);
+  NSArray<id<RCTURLRequestHandler>> * (^_handlersProvider)(RCTModuleRegistry *);
   NSMutableArray<id<RCTNetworkingRequestHandler>> *_requestHandlers;
   NSMutableArray<id<RCTNetworkingResponseHandler>> *_responseHandlers;
 }
@@ -157,12 +158,17 @@ static NSString *RCTGenerateFormBoundary()
 
 RCT_EXPORT_MODULE()
 
++ (BOOL)requiresMainQueueSetup
+{
+  return YES;
+}
+
 - (instancetype)init
 {
   return [super initWithDisabledObservation];
 }
 
-- (instancetype)initWithHandlersProvider:(NSArray<id<RCTURLRequestHandler>> * (^)(void))getHandlers
+- (instancetype)initWithHandlersProvider:(NSArray<id<RCTURLRequestHandler>> * (^)(RCTModuleRegistry *moduleRegistry))getHandlers
 {
   if (self = [super initWithDisabledObservation]) {
     _handlersProvider = getHandlers;
@@ -204,7 +210,7 @@ RCT_EXPORT_MODULE()
 
     if (!_handlers) {
       if (_handlersProvider) {
-        _handlers = _handlersProvider();
+        _handlers = _handlersProvider(self.moduleRegistry);
       } else {
         _handlers = [self.bridge modulesConformingToProtocol:@protocol(RCTURLRequestHandler)];
       }
@@ -388,9 +394,9 @@ RCT_EXPORT_MODULE()
   }
   NSURLRequest *request = [RCTConvert NSURLRequest:query[@"uri"]];
   if (request) {
-
     __block RCTURLRequestCancellationBlock cancellationBlock = nil;
-    RCTNetworkTask *task = [self networkTaskWithRequest:request completionBlock:^(NSURLResponse *response, NSData *data, NSError *error) {
+    id<RCTURLRequestHandler> handler = [self.moduleRegistry moduleForName:"FileRequestHandler"];
+    RCTNetworkTask *task = [self networkTaskWithRequest:request handler:handler completionBlock:^(NSURLResponse *response, NSData *data, NSError *error) {
       dispatch_async(self->_methodQueue, ^{
         cancellationBlock = callback(error, data ? @{@"body": data, @"contentType": RCTNullIfNil(response.MIMEType)} : nil);
       });
@@ -664,6 +670,19 @@ RCT_EXPORT_MODULE()
     return nil;
   }
 
+  RCTNetworkTask *task = [[RCTNetworkTask alloc] initWithRequest:request
+                                                         handler:handler
+                                                   callbackQueue:_methodQueue];
+  task.completionBlock = completionBlock;
+  return task;
+}
+
+- (RCTNetworkTask *)networkTaskWithRequest:(NSURLRequest *)request handler:(id<RCTURLRequestHandler>)handler completionBlock:(RCTURLRequestCompletionBlock)completionBlock
+{
+  if (!handler) {
+    // specified handler is nil, fall back to generic method
+    return [self networkTaskWithRequest:request completionBlock:completionBlock];
+  }
   RCTNetworkTask *task = [[RCTNetworkTask alloc] initWithRequest:request
                                                          handler:handler
                                                    callbackQueue:_methodQueue];

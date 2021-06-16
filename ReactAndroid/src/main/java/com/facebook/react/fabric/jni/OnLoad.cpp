@@ -12,7 +12,9 @@
 #include "CoreComponentsRegistry.h"
 #include "EventBeatManager.h"
 #include "EventEmitterWrapper.h"
+#include "RuntimeSchedulerManager.h"
 #include "StateWrapperImpl.h"
+#include "SurfaceHandlerBinding.h"
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
   return facebook::jni::initialize(vm, [] {
@@ -22,5 +24,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     facebook::react::StateWrapperImpl::registerNatives();
     facebook::react::ComponentFactory::registerNatives();
     facebook::react::CoreComponentsRegistry::registerNatives();
+    facebook::react::SurfaceHandlerBinding::registerNatives();
+    facebook::react::RuntimeSchedulerManager::registerNatives();
   });
 }

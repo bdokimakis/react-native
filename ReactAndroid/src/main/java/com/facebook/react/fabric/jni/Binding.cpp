@@ -7,9 +7,13 @@
 
 #include "Binding.h"
 #include "AsyncEventBeat.h"
+#include "AsyncEventBeatV2.h"
 #include "EventEmitterWrapper.h"
 #include "ReactNativeConfigHolder.h"
 #include "StateWrapperImpl.h"
+
+#include <cfenv>
+#include <cmath>
 
 #include <fbjni/fbjni.h>
 #include <jsi/JSIDynamic.h>
@@ -102,7 +106,7 @@ static inline int getIntBufferSizeForType(CppMountItem::Type mountItemType) {
   } else if (mountItemType == CppMountItem::Type::UpdatePadding) {
     return 5; // tag, top, left, bottom, right
   } else if (mountItemType == CppMountItem::Type::UpdateLayout) {
-    return 7; // tag, x, y, w, h, layoutDirection, DisplayType
+    return 6; // tag, x, y, w, h, DisplayType
   } else if (mountItemType == CppMountItem::Type::UpdateEventEmitter) {
     return 1; // tag
   } else {
@@ -164,7 +168,8 @@ static inline void computeBufferSizes(
 
     batchMountItemIntsSize += getIntBufferSizeForType(mountItemType);
     if (mountItemType == CppMountItem::Type::Create) {
-      batchMountItemObjectsSize += 3; // component name, props, state
+      batchMountItemObjectsSize +=
+          4; // component name, props, state, event emitter
     }
   }
 
@@ -248,15 +253,24 @@ void Binding::startSurface(
     return;
   }
 
-  LayoutContext context;
-  context.pointScaleFactor = pointScaleFactor_;
-  scheduler->startSurface(
-      surfaceId,
-      moduleName->toStdString(),
-      initialProps->consume(),
-      {},
-      context,
+  auto layoutContext = LayoutContext{};
+  layoutContext.pointScaleFactor = pointScaleFactor_;
+
+  auto surfaceHandler = SurfaceHandler{moduleName->toStdString(), surfaceId};
+  surfaceHandler.setProps(initialProps->consume());
+  surfaceHandler.constraintLayout({}, layoutContext);
+
+  scheduler->registerSurface(surfaceHandler);
+
+  surfaceHandler.start();
+
+  surfaceHandler.getMountingCoordinator()->setMountingOverrideDelegate(
       animationDriver_);
+
+  {
+    std::unique_lock<better::shared_mutex> lock(surfaceHandlerRegistryMutex_);
+    surfaceHandlerRegistry_.emplace(surfaceId, std::move(surfaceHandler));
+  }
 }
 
 void Binding::startSurfaceWithConstraints(
@@ -301,13 +315,21 @@ void Binding::startSurfaceWithConstraints(
   constraints.layoutDirection =
       isRTL ? LayoutDirection::RightToLeft : LayoutDirection::LeftToRight;
 
-  scheduler->startSurface(
-      surfaceId,
-      moduleName->toStdString(),
-      initialProps->consume(),
-      constraints,
-      context,
+  auto surfaceHandler = SurfaceHandler{moduleName->toStdString(), surfaceId};
+  surfaceHandler.setProps(initialProps->consume());
+  surfaceHandler.constraintLayout(constraints, context);
+
+  scheduler->registerSurface(surfaceHandler);
+
+  surfaceHandler.start();
+
+  surfaceHandler.getMountingCoordinator()->setMountingOverrideDelegate(
       animationDriver_);
+
+  {
+    std::unique_lock<better::shared_mutex> lock(surfaceHandlerRegistryMutex_);
+    surfaceHandlerRegistry_.emplace(surfaceId, std::move(surfaceHandler));
+  }
 }
 
 void Binding::renderTemplateToSurface(jint surfaceId, jstring uiTemplate) {
@@ -339,7 +361,47 @@ void Binding::stopSurface(jint surfaceId) {
     return;
   }
 
-  scheduler->stopSurface(surfaceId);
+  {
+    std::unique_lock<better::shared_mutex> lock(surfaceHandlerRegistryMutex_);
+
+    auto iterator = surfaceHandlerRegistry_.find(surfaceId);
+
+    if (iterator == surfaceHandlerRegistry_.end()) {
+      LOG(ERROR) << "Binding::stopSurface: Surface with given id is not found";
+      return;
+    }
+
+    auto surfaceHandler = std::move(iterator->second);
+    surfaceHandlerRegistry_.erase(iterator);
+    surfaceHandler.stop();
+    scheduler->unregisterSurface(surfaceHandler);
+  }
+}
+
+void Binding::registerSurface(SurfaceHandlerBinding *surfaceHandlerBinding) {
+  auto scheduler = getScheduler();
+  scheduler->registerSurface(surfaceHandlerBinding->getSurfaceHandler());
+}
+
+void Binding::unregisterSurface(SurfaceHandlerBinding *surfaceHandlerBinding) {
+  auto scheduler = getScheduler();
+  scheduler->unregisterSurface(surfaceHandlerBinding->getSurfaceHandler());
+}
+
+static inline float scale(Float value, Float pointScaleFactor) {
+  std::feclearexcept(FE_ALL_EXCEPT);
+  float result = value * pointScaleFactor;
+  if (std::fetestexcept(FE_OVERFLOW)) {
+    LOG(ERROR) << "Binding::scale - FE_OVERFLOW - value: " << value
+               << " pointScaleFactor: " << pointScaleFactor
+               << " result: " << result;
+  }
+  if (std::fetestexcept(FE_UNDERFLOW)) {
+    LOG(ERROR) << "Binding::scale - FE_UNDERFLOW - value: " << value
+               << " pointScaleFactor: " << pointScaleFactor
+               << " result: " << result;
+  }
+  return result;
 }
 
 void Binding::setConstraints(
@@ -376,7 +438,31 @@ void Binding::setConstraints(
   constraints.layoutDirection =
       isRTL ? LayoutDirection::RightToLeft : LayoutDirection::LeftToRight;
 
-  scheduler->constraintSurfaceLayout(surfaceId, constraints, context);
+  {
+    std::shared_lock<better::shared_mutex> lock(surfaceHandlerRegistryMutex_);
+
+    auto iterator = surfaceHandlerRegistry_.find(surfaceId);
+
+    if (iterator == surfaceHandlerRegistry_.end()) {
+      LOG(ERROR)
+          << "Binding::setConstraints: Surface with given id is not found";
+      return;
+    }
+
+    auto &surfaceHandler = iterator->second;
+    surfaceHandler.constraintLayout(constraints, context);
+  }
+}
+
+bool isMapBufferSerializationEnabled() {
+  static const auto reactFeatureFlagsJavaDescriptor =
+      jni::findClassStatic(Binding::ReactFeatureFlagsJavaDescriptor);
+  static const auto isMapBufferSerializationEnabledMethod =
+      reactFeatureFlagsJavaDescriptor->getStaticMethod<jboolean()>(
+          "isMapBufferSerializationEnabled");
+  bool value =
+      isMapBufferSerializationEnabledMethod(reactFeatureFlagsJavaDescriptor);
+  return value;
 }
 
 void Binding::installFabricUIManager(
@@ -415,21 +501,40 @@ void Binding::installFabricUIManager(
       std::make_shared<JMessageQueueThread>(jsMessageQueueThread);
   auto runtimeExecutor = runtimeExecutorHolder->cthis()->get();
 
+  auto enableV2AsynchronousEventBeat =
+      config->getBool("react_fabric:enable_asynchronous_event_beat_v2_android");
+
   // TODO: T31905686 Create synchronous Event Beat
   jni::global_ref<jobject> localJavaUIManager = javaUIManager_;
   EventBeat::Factory synchronousBeatFactory =
-      [eventBeatManager, runtimeExecutor, localJavaUIManager](
-          EventBeat::SharedOwnerBox const &ownerBox) {
-        return std::make_unique<AsyncEventBeat>(
-            ownerBox, eventBeatManager, runtimeExecutor, localJavaUIManager);
-      };
+      [eventBeatManager,
+       runtimeExecutor,
+       localJavaUIManager,
+       enableV2AsynchronousEventBeat](EventBeat::SharedOwnerBox const &ownerBox)
+      -> std::unique_ptr<EventBeat> {
+    if (enableV2AsynchronousEventBeat) {
+      return std::make_unique<AsyncEventBeatV2>(
+          ownerBox, eventBeatManager, runtimeExecutor, localJavaUIManager);
+    } else {
+      return std::make_unique<AsyncEventBeat>(
+          ownerBox, eventBeatManager, runtimeExecutor, localJavaUIManager);
+    }
+  };
 
   EventBeat::Factory asynchronousBeatFactory =
-      [eventBeatManager, runtimeExecutor, localJavaUIManager](
-          EventBeat::SharedOwnerBox const &ownerBox) {
-        return std::make_unique<AsyncEventBeat>(
-            ownerBox, eventBeatManager, runtimeExecutor, localJavaUIManager);
-      };
+      [eventBeatManager,
+       runtimeExecutor,
+       localJavaUIManager,
+       enableV2AsynchronousEventBeat](EventBeat::SharedOwnerBox const &ownerBox)
+      -> std::unique_ptr<EventBeat> {
+    if (enableV2AsynchronousEventBeat) {
+      return std::make_unique<AsyncEventBeatV2>(
+          ownerBox, eventBeatManager, runtimeExecutor, localJavaUIManager);
+    } else {
+      return std::make_unique<AsyncEventBeat>(
+          ownerBox, eventBeatManager, runtimeExecutor, localJavaUIManager);
+    }
+  };
 
   contextContainer->insert("ReactNativeConfig", config);
   contextContainer->insert("FabricUIManager", javaUIManager_);
@@ -437,8 +542,17 @@ void Binding::installFabricUIManager(
   // Keep reference to config object and cache some feature flags here
   reactNativeConfig_ = config;
 
+  contextContainer->insert(
+      "MapBufferSerializationEnabled", isMapBufferSerializationEnabled());
+
   disablePreallocateViews_ = reactNativeConfig_->getBool(
       "react_fabric:disabled_view_preallocation_android");
+
+  disableVirtualNodePreallocation_ = reactNativeConfig_->getBool(
+      "react_fabric:disable_virtual_node_preallocation");
+
+  enableEarlyEventEmitterUpdate_ = reactNativeConfig_->getBool(
+      "react_fabric:enable_early_event_emitter_update");
 
   auto toolbox = SchedulerToolbox{};
   toolbox.contextContainer = contextContainer;
@@ -547,8 +661,7 @@ void Binding::schedulerDidFinishTransaction(
     auto &mutationType = mutation.type;
     auto &index = mutation.index;
 
-    bool isVirtual = newChildShadowView.layoutMetrics == EmptyLayoutMetrics &&
-        oldChildShadowView.layoutMetrics == EmptyLayoutMetrics;
+    bool isVirtual = mutation.mutatedViewIsVirtual();
 
     switch (mutationType) {
       case ShadowViewMutation::Create: {
@@ -761,6 +874,13 @@ void Binding::schedulerDidFinishTransaction(
         cStateWrapper->state_ = mountItem.newChildShadowView.state;
       }
 
+      // Do not hold a reference to javaEventEmitter from the C++ side.
+      SharedEventEmitter eventEmitter =
+          mountItem.newChildShadowView.eventEmitter;
+      auto javaEventEmitter = EventEmitterWrapper::newObjectJavaArgs();
+      EventEmitterWrapper *cEventEmitter = cthis(javaEventEmitter);
+      cEventEmitter->eventEmitter = eventEmitter;
+
       temp[0] = mountItem.newChildShadowView.tag;
       temp[1] = isLayoutable;
       env->SetIntArrayRegion(intBufferArray, intBufferPosition, 2, temp);
@@ -770,6 +890,7 @@ void Binding::schedulerDidFinishTransaction(
       (*objBufferArray)[objBufferPosition++] = props.get();
       (*objBufferArray)[objBufferPosition++] =
           javaStateWrapper != nullptr ? javaStateWrapper.get() : nullptr;
+      (*objBufferArray)[objBufferPosition++] = javaEventEmitter.get();
     } else if (mountItemType == CppMountItem::Type::Insert) {
       temp[0] = mountItem.newChildShadowView.tag;
       temp[1] = mountItem.parentShadowView.tag;
@@ -846,10 +967,10 @@ void Binding::schedulerDidFinishTransaction(
       auto pointScaleFactor = layoutMetrics.pointScaleFactor;
       auto contentInsets = layoutMetrics.contentInsets;
 
-      int left = floor(contentInsets.left * pointScaleFactor);
-      int top = floor(contentInsets.top * pointScaleFactor);
-      int right = floor(contentInsets.right * pointScaleFactor);
-      int bottom = floor(contentInsets.bottom * pointScaleFactor);
+      int left = floor(scale(contentInsets.left, pointScaleFactor));
+      int top = floor(scale(contentInsets.top, pointScaleFactor));
+      int right = floor(scale(contentInsets.right, pointScaleFactor));
+      int bottom = floor(scale(contentInsets.bottom, pointScaleFactor));
 
       temp[0] = mountItem.newChildShadowView.tag;
       temp[1] = left;
@@ -873,12 +994,10 @@ void Binding::schedulerDidFinishTransaction(
       auto pointScaleFactor = layoutMetrics.pointScaleFactor;
       auto frame = layoutMetrics.frame;
 
-      int x = round(frame.origin.x * pointScaleFactor);
-      int y = round(frame.origin.y * pointScaleFactor);
-      int w = round(frame.size.width * pointScaleFactor);
-      int h = round(frame.size.height * pointScaleFactor);
-      int layoutDirection =
-          toInt(mountItem.newChildShadowView.layoutMetrics.layoutDirection);
+      int x = round(scale(frame.origin.x, pointScaleFactor));
+      int y = round(scale(frame.origin.y, pointScaleFactor));
+      int w = round(scale(frame.size.width, pointScaleFactor));
+      int h = round(scale(frame.size.height, pointScaleFactor));
       int displayType =
           toInt(mountItem.newChildShadowView.layoutMetrics.displayType);
 
@@ -887,10 +1006,9 @@ void Binding::schedulerDidFinishTransaction(
       temp[2] = y;
       temp[3] = w;
       temp[4] = h;
-      temp[5] = layoutDirection;
-      temp[6] = displayType;
-      env->SetIntArrayRegion(intBufferArray, intBufferPosition, 7, temp);
-      intBufferPosition += 7;
+      temp[5] = displayType;
+      env->SetIntArrayRegion(intBufferArray, intBufferPosition, 6, temp);
+      intBufferPosition += 6;
     }
   }
   if (cppUpdateEventEmitterMountItems.size() > 0) {
@@ -999,13 +1117,9 @@ void Binding::driveCxxAnimations() {
   scheduler_->animationTick();
 }
 
-void Binding::schedulerDidRequestPreliminaryViewAllocation(
+void Binding::preallocateShadowView(
     const SurfaceId surfaceId,
     const ShadowView &shadowView) {
-  if (disablePreallocateViews_) {
-    return;
-  }
-
   jni::global_ref<jobject> localJavaUIManager = getJavaUIManager();
   if (!localJavaUIManager) {
     LOG(ERROR)
@@ -1015,15 +1129,16 @@ void Binding::schedulerDidRequestPreliminaryViewAllocation(
 
   bool isLayoutableShadowNode = shadowView.layoutMetrics != EmptyLayoutMetrics;
 
-  if (disableVirtualNodePreallocation_ && !isLayoutableShadowNode) {
-    return;
-  }
-
   static auto preallocateView =
       jni::findClassStatic(Binding::UIManagerJavaDescriptor)
           ->getMethod<void(
-              jint, jint, jstring, ReadableMap::javaobject, jobject, jboolean)>(
-              "preallocateView");
+              jint,
+              jint,
+              jstring,
+              ReadableMap::javaobject,
+              jobject,
+              jobject,
+              jboolean)>("preallocateView");
 
   // Do not hold onto Java object from C
   // We DO want to hold onto C object from Java, since we don't know the
@@ -1033,6 +1148,14 @@ void Binding::schedulerDidRequestPreliminaryViewAllocation(
     javaStateWrapper = StateWrapperImpl::newObjectJavaArgs();
     StateWrapperImpl *cStateWrapper = cthis(javaStateWrapper);
     cStateWrapper->state_ = shadowView.state;
+  }
+
+  // Do not hold a reference to javaEventEmitter from the C++ side.
+  auto javaEventEmitter = EventEmitterWrapper::newObjectJavaArgs();
+  if (enableEarlyEventEmitterUpdate_) {
+    SharedEventEmitter eventEmitter = shadowView.eventEmitter;
+    EventEmitterWrapper *cEventEmitter = cthis(javaEventEmitter);
+    cEventEmitter->eventEmitter = eventEmitter;
   }
 
   local_ref<ReadableMap::javaobject> props = castReadableMap(
@@ -1046,7 +1169,55 @@ void Binding::schedulerDidRequestPreliminaryViewAllocation(
       component.get(),
       props.get(),
       (javaStateWrapper != nullptr ? javaStateWrapper.get() : nullptr),
+      javaEventEmitter.get(),
       isLayoutableShadowNode);
+}
+
+void Binding::schedulerDidRequestPreliminaryViewAllocation(
+    const SurfaceId surfaceId,
+    const ShadowNode &shadowNode) {
+  if (disablePreallocateViews_) {
+    return;
+  }
+
+  auto shadowView = ShadowView(shadowNode);
+
+  if (disableVirtualNodePreallocation_ &&
+      !shadowView.traits.check(ShadowNodeTraits::Trait::FormsView)) {
+    return;
+  }
+
+  preallocateShadowView(surfaceId, shadowView);
+}
+
+void Binding::schedulerDidCloneShadowNode(
+    SurfaceId surfaceId,
+    const ShadowNode &oldShadowNode,
+    const ShadowNode &newShadowNode) {
+  // This is only necessary if view preallocation was skipped during
+  // createShadowNode
+  if (!disableVirtualNodePreallocation_) {
+    return;
+  }
+
+  // We may need to PreAllocate a ShadowNode at this point if this is the
+  // earliest point it is possible to do so:
+  // 1. The revision is exactly 1
+  // 2. At revision 0 (the old node), View Preallocation would have been skipped
+
+  if (newShadowNode.getProps()->revision != 1) {
+    return;
+  }
+  if (oldShadowNode.getProps()->revision != 0) {
+    return;
+  }
+
+  // If the new node is concrete and the old wasn't, we can preallocate
+  if (!oldShadowNode.getTraits().check(ShadowNodeTraits::Trait::FormsView) &&
+      newShadowNode.getTraits().check(ShadowNodeTraits::Trait::FormsView)) {
+    auto shadowView = ShadowView(newShadowNode);
+    preallocateShadowView(surfaceId, shadowView);
+  }
 }
 
 void Binding::schedulerDidDispatchCommand(
@@ -1062,7 +1233,7 @@ void Binding::schedulerDidDispatchCommand(
 
   static auto dispatchCommand =
       jni::findClassStatic(Binding::UIManagerJavaDescriptor)
-          ->getMethod<void(jint, jstring, ReadableArray::javaobject)>(
+          ->getMethod<void(jint, jint, jstring, ReadableArray::javaobject)>(
               "dispatchCommand");
 
   local_ref<JString> command = make_jstring(commandName);
@@ -1071,7 +1242,11 @@ void Binding::schedulerDidDispatchCommand(
       castReadableArray(ReadableNativeArray::newObjectCxxArgs(args));
 
   dispatchCommand(
-      localJavaUIManager, shadowView.tag, command.get(), argsArray.get());
+      localJavaUIManager,
+      shadowView.surfaceId,
+      shadowView.tag,
+      command.get(),
+      argsArray.get());
 }
 
 void Binding::schedulerDidSendAccessibilityEvent(
@@ -1088,16 +1263,19 @@ void Binding::schedulerDidSendAccessibilityEvent(
 
   static auto sendAccessibilityEventFromJS =
       jni::findClassStatic(Binding::UIManagerJavaDescriptor)
-          ->getMethod<void(jint, jstring)>("sendAccessibilityEventFromJS");
+          ->getMethod<void(jint, jint, jstring)>(
+              "sendAccessibilityEventFromJS");
 
   sendAccessibilityEventFromJS(
-      localJavaUIManager, shadowView.tag, eventTypeStr.get());
+      localJavaUIManager,
+      shadowView.surfaceId,
+      shadowView.tag,
+      eventTypeStr.get());
 }
 
-void Binding::schedulerDidSetJSResponder(
-    SurfaceId surfaceId,
-    const ShadowView &shadowView,
-    const ShadowView &initialShadowView,
+void Binding::schedulerDidSetIsJSResponder(
+    ShadowView const &shadowView,
+    bool isJSResponder,
     bool blockNativeResponder) {
   jni::global_ref<jobject> localJavaUIManager = getJavaUIManager();
   if (!localJavaUIManager) {
@@ -1107,46 +1285,47 @@ void Binding::schedulerDidSetJSResponder(
 
   static auto setJSResponder =
       jni::findClassStatic(Binding::UIManagerJavaDescriptor)
-          ->getMethod<void(jint, jint, jboolean)>("setJSResponder");
-
-  setJSResponder(
-      localJavaUIManager,
-      shadowView.tag,
-      initialShadowView.tag,
-      (jboolean)blockNativeResponder);
-}
-
-void Binding::schedulerDidClearJSResponder() {
-  jni::global_ref<jobject> localJavaUIManager = getJavaUIManager();
-  if (!localJavaUIManager) {
-    LOG(ERROR)
-        << "Binding::schedulerClearJSResponder: JavaUIManager disappeared";
-    return;
-  }
+          ->getMethod<void(jint, jint, jint, jboolean)>("setJSResponder");
 
   static auto clearJSResponder =
       jni::findClassStatic(Binding::UIManagerJavaDescriptor)
           ->getMethod<void()>("clearJSResponder");
 
-  clearJSResponder(localJavaUIManager);
+  if (isJSResponder) {
+    setJSResponder(
+        localJavaUIManager,
+        shadowView.surfaceId,
+        shadowView.tag,
+        // The closest non-flattened ancestor of the same value if the node is
+        // not flattened. For now, we don't support the case when the node can
+        // be flattened because the only component that uses this feature -
+        // ScrollView - cannot be flattened.
+        shadowView.tag,
+        (jboolean)blockNativeResponder);
+  } else {
+    clearJSResponder(localJavaUIManager);
+  }
 }
 
 void Binding::registerNatives() {
-  registerHybrid(
-      {makeNativeMethod("initHybrid", Binding::initHybrid),
-       makeNativeMethod(
-           "installFabricUIManager", Binding::installFabricUIManager),
-       makeNativeMethod("startSurface", Binding::startSurface),
-       makeNativeMethod(
-           "startSurfaceWithConstraints", Binding::startSurfaceWithConstraints),
-       makeNativeMethod(
-           "renderTemplateToSurface", Binding::renderTemplateToSurface),
-       makeNativeMethod("stopSurface", Binding::stopSurface),
-       makeNativeMethod("setConstraints", Binding::setConstraints),
-       makeNativeMethod("setPixelDensity", Binding::setPixelDensity),
-       makeNativeMethod("driveCxxAnimations", Binding::driveCxxAnimations),
-       makeNativeMethod(
-           "uninstallFabricUIManager", Binding::uninstallFabricUIManager)});
+  registerHybrid({
+      makeNativeMethod("initHybrid", Binding::initHybrid),
+      makeNativeMethod(
+          "installFabricUIManager", Binding::installFabricUIManager),
+      makeNativeMethod("startSurface", Binding::startSurface),
+      makeNativeMethod(
+          "startSurfaceWithConstraints", Binding::startSurfaceWithConstraints),
+      makeNativeMethod(
+          "renderTemplateToSurface", Binding::renderTemplateToSurface),
+      makeNativeMethod("stopSurface", Binding::stopSurface),
+      makeNativeMethod("setConstraints", Binding::setConstraints),
+      makeNativeMethod("setPixelDensity", Binding::setPixelDensity),
+      makeNativeMethod("driveCxxAnimations", Binding::driveCxxAnimations),
+      makeNativeMethod(
+          "uninstallFabricUIManager", Binding::uninstallFabricUIManager),
+      makeNativeMethod("registerSurface", Binding::registerSurface),
+      makeNativeMethod("unregisterSurface", Binding::unregisterSurface),
+  });
 }
 
 } // namespace react

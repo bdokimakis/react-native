@@ -27,9 +27,9 @@ rn_codegen_components(
 )
 
 rn_codegen_modules(
-    name = "codegen_tests",
+    name = "FBReactNativeTestSpec",
     android_package_name = "com.facebook.fbreact.specs",
-    native_module_spec_name = "FBReactNativeTestSpec",
+    ios_assume_nonnull = False,
     schema_target = ":codegen_tests_schema",
 )
 
@@ -59,7 +59,7 @@ rn_xplat_cxx_library(
     compiler_flags = [
         "-fexceptions",
         "-frtti",
-        "-std=c++14",
+        "-std=c++17",
         "-Wall",
     ],
     platforms = (ANDROID, APPLE),
@@ -83,7 +83,7 @@ rn_xplat_cxx_library(
     compiler_flags = [
         "-fexceptions",
         "-frtti",
-        "-std=c++14",
+        "-std=c++17",
         "-Wall",
     ],
     platforms = (APPLE),

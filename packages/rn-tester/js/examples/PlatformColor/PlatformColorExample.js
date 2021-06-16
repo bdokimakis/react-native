@@ -8,8 +8,6 @@
  * @flow
  */
 
-'use strict';
-
 const React = require('react');
 const ReactNative = require('react-native');
 import Platform from 'react-native/Libraries/Utilities/Platform';
@@ -112,6 +110,7 @@ function PlatformColorsExample() {
         {label: 'systemGray6', color: PlatformColor('systemGray6')},
         // Transparent Color
         {label: 'clear', color: PlatformColor('clear')},
+        {label: 'customColor', color: PlatformColor('customColor')},
       ];
     } else if (Platform.OS === 'android') {
       colors = [
